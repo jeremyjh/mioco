@@ -40,6 +40,7 @@ use std::any::Any;
 use std::marker::{PhantomData, Reflect};
 use mio::util::Slab;
 
+
 /// Read/Write/Both
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum RW {
@@ -49,20 +50,22 @@ pub enum RW {
     Write,
     /// Any / Both (depends on context)
     Both,
+    /// Something else
+    Notify,
 }
 
 impl RW {
     fn has_read(&self) -> bool {
         match *self {
             RW::Read | RW::Both => true,
-            RW::Write => false,
+            RW::Write | RW::Notify => false,
         }
     }
 
     fn has_write(&self) -> bool {
         match *self {
             RW::Write | RW::Both => true,
-            RW::Read => false,
+            RW::Read | RW::Notify => false,
         }
     }
 }
@@ -107,6 +110,18 @@ pub trait Evented : mio::Evented + Any {
     fn as_any(&self) -> &Any;
     /// Convert to &mut Any
     fn as_any_mut(&mut self) -> &mut Any;
+    /// Implement to receive messages sent from EventSource.
+    fn notify(&mut self, handle: MiocoHandle, msg: Message);
+}
+
+/// For any non-evented type which needs to be notified through the event loop.
+
+/// Notified types can have co-routines blocked/resume just like an I/O event source;
+/// Call `wait_notify` to block the co-routine until a particular instance has been notified.
+/// Use `wrap_notified` to get a Sender handle as well as wrapped TypedEventSource.
+pub trait Notified {
+    /// Implement this to receive notifications for a particular source.
+    fn notify(&mut self, handle: MiocoHandle, msg: Message);
 }
 
 impl<T> Evented for T
@@ -118,6 +133,8 @@ where T : mio::Evented+Reflect+'static {
     fn as_any_mut(&mut self) -> &mut Any {
         self as &mut Any
     }
+
+    fn notify(&mut self, _handle: MiocoHandle, _msg: Message) {}
 }
 
 type RefCoroutine = Rc<RefCell<Coroutine>>;
@@ -254,6 +271,11 @@ impl Coroutine {
 
 type RefEventSourceShared = Rc<RefCell<EventSourceShared>>;
 
+enum Source {
+    Evented(Box<Evented+'static>),
+    Notified(Box<Notified+'static>)
+}
+
 /// Wrapped mio IO (mio::Evented+TryRead+TryWrite)
 ///
 /// `Handle` is just a cloneable reference to this struct
@@ -261,7 +283,7 @@ struct EventSourceShared {
     coroutine: RefCoroutine,
     token: Token,
     index: usize, /// Index in MiocoHandle::handles
-    io : Box<Evented+'static>,
+    io : Source,
     peer_hup: bool,
     registered: bool,
 }
@@ -276,6 +298,10 @@ impl EventSourceShared {
     /// Reregister oneshot handler for the next event
     fn reregister<H>(&mut self, event_loop: &mut EventLoop<H>, rw : RW)
         where H : Handler {
+            let io = match self.io {
+                Source::Evented(ref io) => io,
+                Source::Notified(_) => return
+            };
 
             let mut interest = mio::EventSet::none();
 
@@ -294,13 +320,13 @@ impl EventSourceShared {
             if !self.registered {
                 self.registered = true;
                 event_loop.register_opt(
-                    &*self.io, self.token,
+                    &**io, self.token,
                     interest,
                     mio::PollOpt::edge(),
                     ).expect("register_opt failed");
             } else {
                  event_loop.reregister(
-                     &*self.io, self.token,
+                     &**io, self.token,
                      interest, mio::PollOpt::edge() | mio::PollOpt::oneshot()
                      ).ok().expect("reregister failed")
              }
@@ -309,12 +335,16 @@ impl EventSourceShared {
     /// Un-reregister events we're not interested in anymore
     fn unreregister<H>(&self, event_loop: &mut EventLoop<H>)
         where H : Handler {
+            let io = match self.io {
+                Source::Evented(ref io) => io,
+                Source::Notified(_) => return
+            };
             let interest = mio::EventSet::none();
 
             debug_assert!(self.registered);
 
             event_loop.reregister(
-                &*self.io, self.token,
+                &**io, self.token,
                 interest, mio::PollOpt::edge() | mio::PollOpt::oneshot()
                 ).ok().expect("reregister failed")
         }
@@ -322,8 +352,12 @@ impl EventSourceShared {
     /// Un-reregister events we're not interested in anymore
     fn deregister<H>(&mut self, event_loop: &mut EventLoop<H>)
         where H : Handler {
+            let io = match self.io {
+                Source::Evented(ref io) => io,
+                Source::Notified(_) => return
+            };
             if self.registered {
-                event_loop.deregister(&*self.io).expect("deregister failed");
+                event_loop.deregister(&**io).expect("deregister failed");
                 self.registered = false;
             }
         }
@@ -370,31 +404,70 @@ where T : Reflect+'static {
         }
         trace!("coroutine blocked on {:?}", rw);
         coroutine::Coroutine::block();
-        {
-            let inn = self.inn.borrow_mut();
-            debug_assert!(rw.has_read() || inn.coroutine.borrow().last_event.has_write());
-            debug_assert!(rw.has_write() || inn.coroutine.borrow().last_event.has_read());
-            debug_assert!(inn.coroutine.borrow().last_event.index().as_usize() == inn.index);
-        }
+        //TODO: we can block now without having a previous I/O Event (wait_notify) - but
+        // why did we have this guard to begin with, and do we need to preserve it somehow?
+        // {
+        //     let inn = self.inn.borrow_mut();
+        //     debug_assert!(rw.has_read() || inn.coroutine.borrow().last_event.has_write());
+        //     debug_assert!(rw.has_write() || inn.coroutine.borrow().last_event.has_read());
+        //     debug_assert!(inn.coroutine.borrow().last_event.index().as_usize() == inn.index);
+        // }
     }
+}
 
+impl<T> TypedEventSource<T>
+where T : Evented+Reflect+'static {
     /// Access raw mio type
     pub fn with_raw<F>(&self, f : F)
         where F : Fn(&T) {
-        let io = &self.inn.borrow().io;
-        f(io.as_any().downcast_ref::<T>().unwrap())
+        match self.inn.borrow().io {
+            Source::Evented(ref io) =>
+                f(io.as_any().downcast_ref::<T>().unwrap()),
+            Source::Notified(_) =>
+                panic!("Notified source implements Evented!?")
+        }
     }
 
     /// Access mutable raw mio type
     pub fn with_raw_mut<F>(&mut self, f : F)
         where F : Fn(&mut T) {
-        let mut io = &mut self.inn.borrow_mut().io;
-        f(io.as_any_mut().downcast_mut::<T>().unwrap())
+        match self.inn.borrow_mut().io {
+            Source::Evented(ref mut io) =>
+                f(io.as_any_mut().downcast_mut::<T>().unwrap()),
+            Source::Notified(_) =>
+                panic!("Notified Source implements Evented!?")
+        }
     }
 
     /// Index identificator of a `TypedEventSource`
     pub fn index(&self) -> EventSourceIndex {
         EventSourceIndex(self.inn.borrow().index)
+    }
+}
+
+impl<T> TypedEventSource<T>
+where T : Notified+Reflect+'static {
+    ///Block the current co-routine until a notification is received for this
+    ///source.
+    pub fn wait_notify(&self){
+        self.block_on(RW::Notify)
+    }
+
+    ///Get a clonable, thread-safe sender object based on `mio::Sender`.
+    pub fn channel(&self) -> Sender {
+        let inn = self.inn.borrow();
+        let co = inn.coroutine.borrow();
+        let server = co.server_shared.borrow();
+        Sender::new(inn.token,(server.channel.clone()))
+    }
+
+    /// Send a message which will be routed to this particular `TypedEventSource<T>` instance's
+    /// `notify` method.
+    pub fn send(&self, msg: Message) -> Result<(), mio::NotifyError<(Token, Message)>> {
+        let inn = self.inn.borrow();
+        let co = inn.coroutine.borrow();
+        let server = co.server_shared.borrow();
+        server.channel.send((inn.token,msg))
     }
 }
 
@@ -417,6 +490,24 @@ impl EventSource {
             (false, false) => panic!(),
         };
 
+        self.resume(event_loop, event);
+    }
+
+    pub fn notify<H>(&mut self, event_loop: &mut EventLoop<H>, msg: Message)
+    where H : Handler {
+        {
+            let mut inn = self.inn.borrow_mut();
+            let handle = MiocoHandle {coroutine: inn.coroutine.clone()};
+            match inn.io {
+                Source::Notified(ref mut io) => io.notify(handle, msg),
+                Source::Evented(_) => return
+            }
+        }
+        self.resume(event_loop, RW::Notify);
+    }
+
+    fn resume<H>(&mut self, event_loop: &mut EventLoop<H>, event: RW)
+    where H : Handler {
         let my_index = {
             let inn = self.inn.borrow();
             let index = inn.index;
@@ -429,10 +520,12 @@ impl EventSource {
             let inn = self.inn.borrow();
             let coroutine_handle = inn.coroutine.borrow().handle.as_ref().map(|c| c.clone()).unwrap();
             inn.coroutine.borrow_mut().state = State::Running;
-            inn.coroutine.borrow_mut().last_event = LastEvent {
-                rw: event,
-                index: EventSourceIndex(my_index),
-            };
+            if event != RW::Notify {
+                inn.coroutine.borrow_mut().last_event = LastEvent {
+                    rw: event,
+                    index: EventSourceIndex(my_index),
+                };
+            }
             coroutine_handle
         };
 
@@ -447,16 +540,21 @@ impl EventSource {
 
         co.after_resume(event_loop);
     }
+
 }
 
 impl<T> TypedEventSource<T>
-where T : mio::TryAccept+Reflect+'static {
+where T : mio::TryAccept+Evented+Reflect+'static {
     /// Block on accept
     pub fn accept(&self) -> io::Result<T::Output> {
         loop {
             let res = {
-                let mut inn = self.inn.borrow_mut();
-                inn.io.as_any_mut().downcast_mut::<T>().unwrap().accept()
+                match self.inn.borrow_mut().io {
+                    Source::Evented(ref mut io) =>
+                        io.as_any_mut().downcast_mut::<T>().unwrap().accept(),
+                    Source::Notified(_) =>
+                        panic!("Notified source implements Evented!?")
+                }
             };
 
             match res {
@@ -475,13 +573,17 @@ where T : mio::TryAccept+Reflect+'static {
 }
 
 impl<T> std::io::Read for TypedEventSource<T>
-where T : TryRead+Reflect+'static {
+where T : TryRead+Evented+Reflect+'static {
     /// Block on read
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         loop {
             let res = {
-                let mut inn = self.inn.borrow_mut();
-                inn.io.as_any_mut().downcast_mut::<T>().unwrap().try_read(buf)
+                match self.inn.borrow_mut().io {
+                    Source::Evented(ref mut io) =>
+                        io.as_any_mut().downcast_mut::<T>().unwrap().try_read(buf),
+                    Source::Notified(_) =>
+                        panic!("Notified source implements Evented!?")
+                }
             };
 
             match res {
@@ -505,8 +607,12 @@ where T : TryWrite+Reflect+'static {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         loop {
             let res = {
-                let mut inn = self.inn.borrow_mut();
-                inn.io.as_any_mut().downcast_mut::<T>().unwrap().try_write(buf)
+                match self.inn.borrow_mut().io {
+                    Source::Evented(ref mut io) =>
+                        io.as_any_mut().downcast_mut::<T>().unwrap().try_write(buf),
+                    Source::Notified(_) =>
+                        panic!("Notified source implements Evented!?")
+                }
             };
 
             match res {
@@ -576,32 +682,40 @@ impl MiocoHandle {
     /// to perform IO.
     pub fn wrap<T : 'static>(&mut self, io : T) -> TypedEventSource<T>
     where T : Evented {
+        self.add_source::<T>(Source::Evented(Box::new(io)))
+    }
+
+    ///TODO: could we dispatch this dynamically rather than the separate method for notify?
+    pub fn wrap_notified<T : 'static>(&mut self, io : T) -> TypedEventSource<T>
+    where T : Notified {
+        self.add_source::<T>(Source::Notified(Box::new(io)))
+    }
+
+    fn add_source<T : 'static>(&mut self, source: Source) -> TypedEventSource<T>{
         let token = {
             let co = self.coroutine.borrow();
             let mut shared = co.server_shared.borrow_mut();
             shared.sources.insert_with(|token| {
                 EventSource {
                     inn: Rc::new(RefCell::new(
-                                 EventSourceShared {
-                                     coroutine: self.coroutine.clone(),
-                                     io: Box::new(io),
-                                     token: token,
-                                     peer_hup: false,
-                                     index: self.coroutine.borrow().io.len(),
-                                     registered: false,
-                                 }
-                                 )),
+                                    EventSourceShared {
+                                        coroutine: self.coroutine.clone(),
+                                        io: source,
+                                        token: token,
+                                        peer_hup: false,
+                                        index: self.coroutine.borrow().io.len(),
+                                        registered: false,
+                                    }
+                                    )),
                 }
             })
         }.expect("run out of tokens");
         trace!("Added source token={:?}", token);
-
         let io = {
             let co = self.coroutine.borrow();
             let shared = co.server_shared.borrow_mut();
             shared.sources[token].inn.clone()
         };
-
         let handle = TypedEventSource {
             inn: io.clone(),
             _t: PhantomData,
@@ -721,6 +835,7 @@ impl MiocoHandle {
 }
 
 type RefServerShared = Rc<RefCell<ServerShared>>;
+
 /// Data belonging to `Server`, but referenced and manipulated by `Coroutine`-es
 /// belonging to it.
 struct ServerShared {
@@ -733,13 +848,17 @@ struct ServerShared {
 
     /// Number of `Coroutine`-s running in the `Server`.
     coroutines_no : u32,
+
+    /// The mio loop
+    channel: MioSender
 }
 
 impl ServerShared {
-    fn new() -> ServerShared {
+    fn new(channel: MioSender) -> ServerShared {
         ServerShared {
             sources: Slab::new(1024),
             coroutines_no: 0,
+            channel: channel,
         }
     }
 }
@@ -815,9 +934,38 @@ impl Server {
     }
 }
 
+/// Wrapper for msg delivered through `mioco::Evented::notify`.
+pub type Message = Box<Any+'static+Send>;
+
+/// Sends notify messages to the mioco Event Loop.
+pub type MioSender = mio::Sender<<Server as mio::Handler>::Message>;
+
+
+#[derive(Clone)]
+/// Wrapper around `mio::Sender` which will route messages to the correct
+/// event source instance.
+pub struct Sender {
+    inner: MioSender,
+    token: Token
+}
+// mio::Sender is Send
+unsafe impl Send for Sender { }
+
+impl Sender{
+    fn new(token: Token, sender: MioSender) -> Sender{
+       Sender {token: token, inner: sender}
+    }
+    /// Send a message which will be routed to the `TypedEventSource<T>` instance which created this
+    /// instance of `Sender`.
+    pub fn send(&self, msg: Message) -> Result<(), mio::NotifyError<(Token, Message)>> {
+        self.inner.send((self.token,msg))
+    }
+}
+
+
 impl mio::Handler for Server {
     type Timeout = usize;
-    type Message = ();
+    type Message = (Token, Message);
 
     fn ready(&mut self, event_loop: &mut mio::EventLoop<Server>, token: mio::Token, events: mio::EventSet) {
         // It's possible we got an event for a Source that was deregistered
@@ -835,6 +983,20 @@ impl mio::Handler for Server {
         source.ready(event_loop, token, events);
         trace!("Server::ready finished");
     }
+
+    fn notify(&mut self, event_loop: &mut EventLoop<Self>, msg: Self::Message) {
+        let (token, msg) = msg;
+        trace!("Server::notify(token={:?})", token);
+        let mut source = match self.shared.borrow().sources.get(token) {
+            Some(source) => source.clone(),
+            None => {
+                trace!("Server::notify() ignored");
+                return
+            },
+        };
+        source.notify(event_loop, msg);
+        trace!("Server::notify finished");
+    }
 }
 
 /// Start mioco handling
@@ -847,9 +1009,9 @@ impl mio::Handler for Server {
 pub fn start<F>(f : F)
     where F : FnOnce(&mut MiocoHandle) -> io::Result<()> + 'static,
 {
-    let mut event_loop : EventLoop<Server> = EventLoop::new().expect("new EventLoop");
+    let mut event_loop = EventLoop::new().expect("new EventLoop");
 
-    let shared = Rc::new(RefCell::new(ServerShared::new()));
+    let shared = Rc::new(RefCell::new(ServerShared::new(event_loop.channel())));
     let mut server = Server::new(shared.clone());
     let coroutine_ref = spawn_impl(f, shared);
 
