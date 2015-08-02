@@ -102,7 +102,7 @@ enum State {
 }
 
 /// `mioco` can work on any type implementing this trait
-pub trait Evented : mio::Evented + Any {
+pub trait Evented : Any {
     /// Convert to &Any
     fn as_any(&self) -> &Any;
     /// Convert to &mut Any
@@ -249,7 +249,6 @@ impl Coroutine {
     }
 
     fn reregister_blocked_on(&mut self, event_loop: &mut EventLoop<Server>) {
-
         let rw = match self.state {
             State::BlockedOn(rw) => rw,
             _ => panic!("This should not happen"),
