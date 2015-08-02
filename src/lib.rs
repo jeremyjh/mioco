@@ -101,6 +101,15 @@ enum State {
     Finished,
 }
 
+/// Message delivered through `mioco::Evented::notify`.
+pub type Message = Box<Any+'static+Send>;
+
+/// Sends notify `Message` to the mioco Event Loop.
+pub type MioSender = mio::Sender<<Server as mio::Handler>::Message>;
+
+
+
+#[allow(unused_variables)]
 /// `mioco` can work on any type implementing this trait
 pub trait Evented : Any {
     /// Convert to &Any
@@ -109,13 +118,16 @@ pub trait Evented : Any {
     fn as_any_mut(&mut self) -> &mut Any;
 
     /// Register
-    fn register(&self, event_loop : &mut EventLoop<Server>, token : Token, interest : EventSet);
+    fn register(&self, event_loop : &mut EventLoop<Server>, token : Token, interest : EventSet) {}
 
     /// Reregister
-    fn reregister(&self, event_loop : &mut EventLoop<Server>, token : Token, interest : EventSet);
+    fn reregister(&self, event_loop : &mut EventLoop<Server>, token : Token, interest : EventSet) {}
 
     /// Deregister
-    fn deregister(&self, event_loop : &mut EventLoop<Server>, token : Token);
+    fn deregister(&self, event_loop : &mut EventLoop<Server>, token : Token) {}
+
+    /// Receive Notify messages
+    fn notify(&mut self, handle: MiocoHandle, msg: Message) {}
 }
 
 impl<T> Evented for T
@@ -148,6 +160,7 @@ where T : mio::Evented+Reflect+'static {
         event_loop.deregister(self).expect("deregister failed");
     }
 }
+
 
 type RefCoroutine = Rc<RefCell<Coroutine>>;
 
@@ -380,6 +393,10 @@ where T : Reflect+'static {
             debug_assert!(inn.coroutine.borrow().last_event.index().as_usize() == inn.index);
         }
     }
+    ///Block the current co-routine until a read event or notification is ready
+    pub fn wait_read(&self){
+        self.block_on(RW::Read)
+    }
 
     /// Access raw mio type
     pub fn with_raw<F>(&self, f : F)
@@ -398,6 +415,23 @@ where T : Reflect+'static {
     /// Index identificator of a `TypedEventSource`
     pub fn index(&self) -> EventSourceIndex {
         EventSourceIndex(self.inn.borrow().index)
+    }
+
+    ///Get a clonable, thread-safe sender object based on `mio::Sender`.
+    pub fn channel(&self) -> Sender {
+        let inn = self.inn.borrow();
+        let co = inn.coroutine.borrow();
+        let server = co.server_shared.borrow();
+        Sender::new(inn.token,(server.channel.clone()))
+    }
+
+    /// Send a message which will be routed to this particular `TypedEventSource<T>` instance's
+    /// `notify` method.
+    pub fn send(&self, msg: Message) -> Result<(), mio::NotifyError<(Token, Message)>> {
+        let inn = self.inn.borrow();
+        let co = inn.coroutine.borrow();
+        let server = co.server_shared.borrow();
+        server.channel.send((inn.token,msg))
     }
 }
 
@@ -448,6 +482,16 @@ impl EventSource {
         let mut co = coroutine.borrow_mut();
 
         co.after_resume(event_loop);
+    }
+
+    pub fn notify(&mut self, event_loop: &mut EventLoop<Server>, msg: Message) {
+        let token = {
+            let mut inn = self.inn.borrow_mut();
+            let handle = MiocoHandle {coroutine: inn.coroutine.clone()};
+            inn.io.notify(handle, msg);
+            inn.token
+        };
+        self.ready(event_loop, token, EventSet::readable())
     }
 }
 
@@ -577,7 +621,8 @@ impl MiocoHandle {
     /// Consumes the `io`, returns a mioco wrapper over it. Use this wrapped IO
     /// to perform IO.
     pub fn wrap<T : 'static>(&mut self, io : T) -> TypedEventSource<T>
-    where T : Evented {
+        where T : Evented
+    {
         let token = {
             let co = self.coroutine.borrow();
             let mut shared = co.server_shared.borrow_mut();
@@ -735,13 +780,17 @@ struct ServerShared {
 
     /// Number of `Coroutine`-s running in the `Server`.
     coroutines_no : u32,
+
+    //Channel to send notify events.
+    channel: MioSender,
 }
 
 impl ServerShared {
-    fn new() -> Self {
+    fn new(channel: MioSender) -> ServerShared {
         ServerShared {
             sources: Slab::new(1024),
             coroutines_no: 0,
+            channel: channel
         }
     }
 }
@@ -817,9 +866,31 @@ impl Server {
     }
 }
 
+#[derive(Clone)]
+/// Wrapper around `mio::Sender` which will route messages to the correct
+/// event source instance.
+pub struct Sender {
+    inner: MioSender,
+    token: Token
+}
+
+// mio::Sender is Send
+unsafe impl Send for Sender { }
+
+impl Sender{
+    fn new(token: Token, sender: MioSender) -> Sender{
+       Sender {token: token, inner: sender}
+    }
+    /// Send a message which will be routed to the `TypedEventSource<T>` instance which created this
+    /// instance of `Sender`.
+    pub fn send(&self, msg: Message) -> Result<(), mio::NotifyError<(Token, Message)>> {
+        self.inner.send((self.token,msg))
+    }
+}
+
 impl mio::Handler for Server {
     type Timeout = usize;
-    type Message = ();
+    type Message = (Token, Message);
 
     fn ready(&mut self, event_loop: &mut mio::EventLoop<Server>, token: mio::Token, events: mio::EventSet) {
         // It's possible we got an event for a Source that was deregistered
@@ -837,6 +908,20 @@ impl mio::Handler for Server {
         source.ready(event_loop, token, events);
         trace!("Server::ready finished");
     }
+
+    fn notify(&mut self, event_loop: &mut EventLoop<Server>, msg: Self::Message) {
+        let (token, msg) = msg;
+        trace!("Server::notify(token={:?})", token);
+        let mut source = match self.shared.borrow().sources.get(token) {
+            Some(source) => source.clone(),
+            None => {
+                trace!("Server::notify() ignored");
+                return
+            },
+        };
+        source.notify(event_loop, msg);
+        trace!("Server::notify finished");
+    }
 }
 
 /// Mioco struct
@@ -848,9 +933,10 @@ pub struct Mioco {
 impl Mioco {
     /// Create new `Mioco` instance
     pub fn new() -> Self {
-        let shared = Rc::new(RefCell::new(ServerShared::new()));
+        let event_loop = EventLoop::new().expect("new EventLoop");
+        let shared = Rc::new(RefCell::new(ServerShared::new(event_loop.channel())));
         Mioco {
-            event_loop: EventLoop::new().expect("new EventLoop"),
+            event_loop: event_loop,
             server: Server::new(shared.clone()),
         }
     }
